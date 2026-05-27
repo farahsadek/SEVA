@@ -17,7 +17,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "seva-production-0dbc.up.railway.app"
+        "https://seva-production-0dbc.up.railway.app"
     ],
     allow_methods=["*"],
     allow_headers=["*"],

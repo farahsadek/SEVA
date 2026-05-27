@@ -1,0 +1,62 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&display=swap');
+@import url('https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css');
+
+:root {
+  --bg:          #f0f2ee;
+  --primary:     #3E433A;
+  --primary2:    #2e322a;
+  --accent:      #9EB18F;
+  --border:      #c8d0c2;
+  --text:        #1e2218;
+  --muted:       #4a5244;
+  --muted2:      #717A6A;
+  --muted3:      #8a9484;
+  --white:       #ffffff;
+  --green-tag:   #ddebd4;
+  --amber-tag:   #f0e8d4;
+  --green-text:  #2a3a22;
+  --amber-text:  #6b4a1a;
+  --status-dot:  #9EB18F;
+  --card-border: #d8e0d0;
+  --step-inact:  #c4ccc0;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  cursor: pointer;
+  font-family: inherit;
+}
+
+input, select, textarea {
+  font-family: inherit;
+  font-size: 13px;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+/* ── Spinner animation (used for transcribing mic state) ── */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.spin {
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}

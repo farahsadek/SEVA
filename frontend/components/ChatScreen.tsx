@@ -1,8 +1,6 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 import { sendMessage, clearMemory } from "../lib/api";
 import { useJsApiLoader, GoogleMap, Marker, Polyline } from "@react-google-maps/api";
 
@@ -221,7 +219,7 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
           resolve(loc);
         },
         () => resolve(null),
-        { timeout: 4000, maximumAge: 60000 }
+        { timeout: 10000, maximumAge: 30000, enableHighAccuracy: false }
       );
     });
   }
@@ -546,6 +544,7 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
                       borderLeft: "3px solid var(--primary)",
                       borderRadius: "0 12px 12px 12px",
                       padding: "12px 14px", fontSize: 13, color: "var(--text)", lineHeight: 1.6,
+                      width: "100%", boxSizing: "border-box" as const,
                     }}>
                       <p style={{ margin: 0 }}>{msg.parsed?.intro || msg.content}</p>
                     </div>
@@ -774,19 +773,25 @@ function StationCard({ station }: { station: StationMapData }) {
         )}
       </div>
 
-      {/* Details grid */}
-      <div style={{ padding: "10px 14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+      {/* Details grid — responsive: 2-col on wider screens, 1-col on narrow */}
+      <div style={{ padding: "10px 14px", display: "flex", flexDirection: "column", gap: 7 }}>
         {[
-          { icon: "ti-building", label: "Operator",    val: station.operator },
-          { icon: "ti-clock",    label: "Charge time", val: `~${station.charge_time} min to ${station.target_battery}%` },
-          { icon: "ti-plug",     label: "Connectors",  val: station.connectors },
-          { icon: "ti-route",    label: "Detour",      val: `${station.detour_km} km from route` },
-          { icon: "ti-currency-pound", label: "Rate",  val: `${station.rate_egp_kwh} EGP/kWh` },
+          { icon: "ti-building",       label: "Operator",    val: station.operator },
+          { icon: "ti-clock",          label: "Charge time", val: `~${station.charge_time} min to ${station.target_battery}%` },
+          { icon: "ti-plug",           label: "Connectors",  val: station.connectors },
+          { icon: "ti-route",          label: "Detour",      val: `${station.detour_km !== undefined ? station.detour_km + " km" : "—"}` },
+          { icon: "ti-currency-pound", label: "Rate",        val: `${station.rate_egp_kwh} EGP/kWh` },
         ].filter(r => r.val).map(r => (
-          <div key={r.label} style={{ fontSize: 11, color: "#5F5E5A", display: "flex", alignItems: "center", gap: 5 }}>
-            <i className={`ti ${r.icon}`} />
-            {r.label}
-            <span style={{ color: "var(--text)", fontWeight: 500, marginLeft: "auto" }}>{r.val}</span>
+          <div key={r.label} style={{
+            fontSize: 12, color: "#5F5E5A",
+            display: "flex", alignItems: "center", gap: 6,
+            justifyContent: "space-between",
+          }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
+              <i className={`ti ${r.icon}`} />
+              {r.label}
+            </span>
+            <span style={{ color: "var(--text)", fontWeight: 500, textAlign: "right", maxWidth: "55%" }}>{r.val}</span>
           </div>
         ))}
       </div>

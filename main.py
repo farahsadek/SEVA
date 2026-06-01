@@ -6,7 +6,7 @@ import uvicorn
 from groq import Groq
 
 
-from backend.llm import clear_last_map_data, get_seva_response, clear_memory, get_last_map_data, get_chat_history, set_charging_mode
+from backend.llm import clear_last_map_data, get_seva_response, clear_memory, get_last_map_data, get_chat_history, set_charging_mode, clear_map_data_only
 from backend.profile import load_profile, create_profile, save_profile, profile_exists, add_liked_station, add_avoided_station, add_preference_signal
 from data.ev_helper import get_all_brands, get_models_by_brand, get_car_specs
 from backend.geocoding import geocode

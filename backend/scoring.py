@@ -43,6 +43,8 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
     car_max_dc_kw = specs["max_dc_kw"]
     car_max_ac_kw = specs["max_ac_kw"]
 
+    effective_range_check = specs["range_km"] * AC_MULTIPLIERS.get(ac_usage, 0.92)
+
     if charging_mode == "charge_to_80":
         global_target = 80
         if battery_level >= 80:
@@ -52,9 +54,8 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
         if battery_level == 100:
             raise ValueError("Your battery is already full. No charging needed!")
     elif charging_mode == "complete_trip":
-        effective_range_km  = specs["range_km"] * AC_MULTIPLIERS.get(ac_usage, 0.92)
-        energy_needed_pct   = (route_distance_km / effective_range_km) * 100
-        usable_pct          = battery_level - min_threshold
+        energy_needed_pct = (route_distance_km / effective_range_check) * 100
+        usable_pct        = battery_level - min_threshold
         if usable_pct >= energy_needed_pct:
             raise ValueError(
                 f"Your current battery ({battery_level}%) is enough to complete this "
@@ -71,9 +72,17 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
     rejected_avoided   = 0
 
     effective_range   = specs["range_km"] * AC_MULTIPLIERS.get(ac_usage, 0.92)
-    battery_available = max(0, battery_level - min_threshold)
+
+    # If battery is already below threshold, we're in emergency mode
+    # Use all remaining battery to find the nearest reachable station
+    if battery_level <= min_threshold:
+        battery_available = max(1, battery_level - 5)  # reserve only 5% absolute minimum
+        print(f"[scoring] EMERGENCY: battery ({battery_level}%) is at or below threshold ({min_threshold}%) — using emergency range")
+    else:
+        battery_available = battery_level - min_threshold
+
     range_available   = (battery_available / 100) * effective_range * 0.9
-    print(f"[scoring] battery_level={battery_level}, min_threshold={min_threshold}, range_available={range_available}")
+    print(f"[scoring] battery_level={battery_level}, min_threshold={min_threshold}, battery_available={battery_available}%, range_available={round(range_available, 1)}km")
 
     for station in stations:
         if is_station_avoided(profile, station["id"]):
@@ -99,13 +108,20 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
     if not filtered:
         total = len(stations)
         if rejected_range == total:
-            raise ValueError(
-                f"Your battery is too low to reach any charging station safely. "
-                f"At {battery_level}% with a {min_threshold}% minimum threshold, "
-                f"you have {max(0, battery_level - min_threshold)}% usable charge — "
-                f"not enough to reach any station along this route. "
-                f"Please charge to at least {min_threshold + 15}% before attempting this trip."
-            )
+            if battery_level <= min_threshold:
+                raise ValueError(
+                    f"Your battery is critically low at {battery_level}%. "
+                    f"None of the charging stations along this route are close enough to reach safely. "
+                    f"Please find the nearest charging point immediately or call roadside assistance."
+                )
+            else:
+                raise ValueError(
+                    f"Your battery is too low to reach any charging station safely. "
+                    f"At {battery_level}% with a {min_threshold}% minimum threshold, "
+                    f"you have {max(0, battery_level - min_threshold)}% usable charge — "
+                    f"not enough to reach any station along this route. "
+                    f"Please charge to at least {min_threshold + 15}% before attempting this trip."
+                )
         elif rejected_connector == total:
             raise ValueError(
                 f"None of the charging stations along this route are compatible "
@@ -117,13 +133,20 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
                 "Try clearing some avoided stations or choosing a different route."
             )
         elif rejected_range > rejected_connector:
-            raise ValueError(
-                f"Your battery is too low to safely reach any charging station. "
-                f"At {battery_level}% with a {min_threshold}% minimum threshold, "
-                f"you only have {max(0, battery_level - min_threshold)}% usable charge. "
-                f"Please charge to at least {min_threshold + 15}% before this trip "
-                f"({rejected_connector} station(s) also had incompatible connectors)."
-            )
+            if battery_level <= min_threshold:
+                raise ValueError(
+                    f"Your battery is critically low at {battery_level}%. "
+                    f"No reachable compatible stations were found along this route. "
+                    f"Please find the nearest charging point immediately."
+                )
+            else:
+                raise ValueError(
+                    f"Your battery is too low to safely reach any charging station. "
+                    f"At {battery_level}% with a {min_threshold}% minimum threshold, "
+                    f"you only have {max(0, battery_level - min_threshold)}% usable charge. "
+                    f"Please charge to at least {min_threshold + 15}% before this trip "
+                    f"({rejected_connector} station(s) also had incompatible connectors)."
+                )
         else:
             raise ValueError(
                 f"No suitable stations found — "
@@ -199,27 +222,11 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
         if global_target is not None:
             target_battery = global_target
         else:
-            # complete_trip mode: calculate how much charge is needed
-            # accounting for energy already spent reaching the station
-            dist_origin_to_station = _haversine(origin_lat, origin_lng, station_lat, station_lng)
-            effective_range        = specs["range_km"] * AC_MULTIPLIERS.get(ac_usage, 0.92)
-
-            # Battery remaining when arriving at the station
-            energy_to_station_pct  = (dist_origin_to_station / effective_range) * 100
-            battery_at_station     = max(min_threshold, battery_level - energy_to_station_pct)
-
-            # Energy needed from station to destination
-            energy_to_dest_pct     = (dist_station_to_dest / effective_range) * 100
-
-            # Target = enough to reach destination + min threshold buffer
-            target_battery         = battery_at_station + energy_to_dest_pct + min_threshold
-            target_battery         = min(round(target_battery), 80)  # cap at 80%
-            target_battery         = max(target_battery, round(battery_at_station) + 1)  # must charge at least 1%
-
-            print(f"[scoring] complete_trip: dist_to_station={round(dist_origin_to_station,1)}km, "
-                  f"battery_at_station={round(battery_at_station,1)}%, "
-                  f"energy_to_dest={round(energy_to_dest_pct,1)}%, "
-                  f"target={target_battery}%")
+            target_battery = calculate_target_charge(
+                car_model, battery_level, dist_station_to_dest, ac_usage, min_threshold
+            )
+        if target_battery <= battery_level:
+            target_battery = battery_level + 1
 
         charge_time        = estimate_charge_time(car_model, battery_level, target_battery, best_power_kw, best_is_dc)
         best_possible_time = estimate_charge_time(car_model, battery_level, target_battery, car_max_dc_kw, True)

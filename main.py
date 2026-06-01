@@ -95,6 +95,9 @@ async def chat(req: ChatReq):
     profile_to_use["current_location"] = req.profile.get("current_location")
     profile_to_use["battery_pct"]      = req.profile.get("battery_pct", 100)
 
+    # Clear previous map data so follow-ups don't return stale stations
+    clear_map_data_only()
+
     response = get_seva_response(req.message, req.session_id, profile_to_use)
     map_data = get_last_map_data()
     return {

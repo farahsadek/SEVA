@@ -40,6 +40,12 @@ def clear_last_map_data() -> None:
     print(f"[llm] Cleared cached profile and map data")
 
 
+def clear_map_data_only() -> None:
+    """Clear only map data between chat turns — preserves profile and trip context."""
+    global _last_map_data
+    _last_map_data = None
+
+
 # ── Memory ────────────────────────────────────────────────────────────────────
 _mongo_client = MongoClient(os.getenv("MONGODB_URI"))
 

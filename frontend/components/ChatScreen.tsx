@@ -1,10 +1,10 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { sendMessage, clearMemory } from "../lib/api";
-import { useJsApiLoader, GoogleMap, Marker, Polyline } from "@react-google-maps/api";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { sendMessage, clearMemory } from "../lib/api";
+import { useJsApiLoader, GoogleMap, Marker, Polyline } from "@react-google-maps/api";
 
 interface Message {
   role: "user" | "assistant";
@@ -50,8 +50,10 @@ interface Props {
   onUpdateProfile: () => void;
 }
 
-function parseResponse(text: string, mapData: StationMapData[] | null): ParsedResponse {
-  const lines = text.trim().split("\n");
+function parseResponse(text: string, mapData: StationMapData[] | null, isFreshData: boolean = false): ParsedResponse {
+  // Strip any SHOW_CARDS tags from display
+  const cleanText = text.replace("[SHOW_CARDS]", "").trim();
+  const lines     = cleanText.split("\n");
 
   const intro = lines.find(l => {
     const clean = l.trim();
@@ -59,6 +61,8 @@ function parseResponse(text: string, mapData: StationMapData[] | null): ParsedRe
       && !clean.startsWith("[")
       && !clean.startsWith("Option ")
       && !clean.startsWith("TOP 3")
+      && !clean.startsWith("TOP 2")
+      && !clean.startsWith("TOP 1")
       && !clean.startsWith("ROUTE:")
       && !clean.startsWith("Write ")
       && !clean.startsWith("-")
@@ -67,7 +71,7 @@ function parseResponse(text: string, mapData: StationMapData[] | null): ParsedRe
 
   return {
     intro,
-    hasCards: !!(mapData && mapData.length > 0),
+    hasCards: isFreshData && !!(mapData && mapData.length > 0),
   };
 }
 
@@ -84,6 +88,7 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
   const [userLocation, setUserLocation]     = useState<{lat: number, lng: number} | null>(null);
   const [awaitingChargingMode, setAwaitingChargingMode] = useState(false);
   const [pendingMessage, setPendingMessage]             = useState<string | null>(null);
+  const [lastMapData, setLastMapData]                   = useState<StationMapData[] | null>(null);
   const [recording, setRecording]                       = useState(false);
   const [transcribing, setTranscribing]                 = useState(false);
   const mediaRecorderRef                                = useRef<MediaRecorder | null>(null);
@@ -221,7 +226,7 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
           resolve(loc);
         },
         () => resolve(null),
-        { timeout: 10000, maximumAge: 30000, enableHighAccuracy: false }
+        { timeout: 4000, maximumAge: 60000 }
       );
     });
   }
@@ -247,13 +252,16 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
     setLoading(true);
 
     try {
-      const res    = await sendMessage(msg, sessionId, {
+      const res          = await sendMessage(msg, sessionId, {
         ...profile, battery_pct: currentBattery, current_location: userLocation,
       });
-      const mapData = Array.isArray(res.map_data) ? res.map_data : null;
-      const parsed  = parseResponse(res.response || "", mapData);
+      const freshMapData  = Array.isArray(res.map_data) && res.map_data.length > 0 ? res.map_data : null;
+      const mapData       = freshMapData || lastMapData;
+      if (freshMapData) setLastMapData(freshMapData);
+      const cleanResponse = (res.response || "").replace("[SHOW_CARDS]", "").trim();
+      const parsed        = parseResponse(cleanResponse, freshMapData ? mapData : null, !!freshMapData);
       setMessages(prev => [...prev, {
-        role: "assistant", content: res.response, parsed, mapData,
+        role: "assistant", content: cleanResponse, parsed, mapData: freshMapData ? mapData : undefined,
       }]);
     } catch {
       setMessages(prev => [...prev, {
@@ -271,6 +279,7 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
     setOpenMapKey(null);
     setAwaitingChargingMode(false);
     setPendingMessage(null);
+    setLastMapData(null);
   }
 
   async function handleChargingMode(mode: "complete_trip" | "charge_to_80" | "charge_to_100") {
@@ -297,13 +306,16 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
         body: JSON.stringify({ mode }),
       });
 
-      const res    = await sendMessage(pendingMessage, sessionId, {
+      const res          = await sendMessage(pendingMessage, sessionId, {
         ...profile, battery_pct: currentBattery, current_location: userLocation,
       });
-      const mapData = Array.isArray(res.map_data) ? res.map_data : null;
-      const parsed  = parseResponse(res.response || "", mapData);
+      const freshMapData  = Array.isArray(res.map_data) && res.map_data.length > 0 ? res.map_data : null;
+      const mapData       = freshMapData || lastMapData;
+      if (freshMapData) setLastMapData(freshMapData);
+      const cleanResponse = (res.response || "").replace("[SHOW_CARDS]", "").trim();
+      const parsed        = parseResponse(cleanResponse, freshMapData ? mapData : null, !!freshMapData);
       setMessages(prev => [...prev, {
-        role: "assistant", content: res.response, parsed, mapData,
+        role: "assistant", content: cleanResponse, parsed, mapData: freshMapData ? mapData : undefined,
       }]);
     } catch {
       setMessages(prev => [...prev, {

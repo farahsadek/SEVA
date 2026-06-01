@@ -24,6 +24,7 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
     car_model         = profile["car_model"]
     max_detour_km     = profile["max_detour_km"]
     price_sensitivity = profile["price_sensitivity"]
+    print(f"[scoring] price_sensitivity value received: '{price_sensitivity}'")
     ac_usage          = profile["ac_usage"]
     min_threshold     = profile["min_battery_threshold"]
     saved_dests       = profile.get("saved_destinations", [])
@@ -42,8 +43,6 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
     car_max_dc_kw = specs["max_dc_kw"]
     car_max_ac_kw = specs["max_ac_kw"]
 
-    effective_range_check = specs["range_km"] * AC_MULTIPLIERS.get(ac_usage, 0.92)
-
     if charging_mode == "charge_to_80":
         global_target = 80
         if battery_level >= 80:
@@ -53,8 +52,10 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
         if battery_level == 100:
             raise ValueError("Your battery is already full. No charging needed!")
     elif charging_mode == "complete_trip":
-        energy_needed_pct = (route_distance_km / effective_range_check) * 100
-        if (battery_level - energy_needed_pct) >= min_threshold:
+        effective_range_km  = specs["range_km"] * AC_MULTIPLIERS.get(ac_usage, 0.92)
+        energy_needed_pct   = (route_distance_km / effective_range_km) * 100
+        usable_pct          = battery_level - min_threshold
+        if usable_pct >= energy_needed_pct:
             raise ValueError(
                 f"Your current battery ({battery_level}%) is enough to complete this "
                 f"{round(route_distance_km)}km trip. No charging needed!"
@@ -131,6 +132,21 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
                 f"and {rejected_avoided} were in your avoided list."
             )
 
+    # ── Hard filter: low cost → AC-only stations ──────────────────────────────
+    if price_sensitivity == "low cost":
+        ac_compatible = [
+            s for s in filtered
+            if any(
+                c["power_kw"] <= 22 and is_station_compatible(car_model, c["connection_type_title"], c["power_kw"])
+                for c in s["connectors"]
+            )
+        ]
+        if ac_compatible:
+            filtered = ac_compatible
+            print(f"[scoring] Low cost filter: kept {len(filtered)} AC-compatible stations (DC excluded)")
+        else:
+            print(f"[scoring] Low cost filter: no AC stations found — keeping all {len(filtered)} as fallback")
+
     print(f"[scoring] Fetching real detours for {len(filtered)} stations...")
     detours = get_station_detours(
         filtered,
@@ -139,6 +155,14 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
         route_distance_km
     )
     print(f"[scoring] Detours fetched: {detours}")
+
+    # ── Hard filter: remove stations that exceed max_detour_km ───────────────
+    within_detour = [s for s in filtered if detours.get(s["id"], 0) <= max_detour_km]
+    if within_detour:
+        filtered = within_detour
+        print(f"[scoring] Detour hard filter ({max_detour_km}km): {len(filtered)} stations remain")
+    else:
+        print(f"[scoring] No stations within {max_detour_km}km detour limit — keeping all {len(filtered)} as fallback")
 
     # ── STEP 2 — SCORE EACH STATION ───────────────────────────────────────────
     scored = []
@@ -175,11 +199,27 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
         if global_target is not None:
             target_battery = global_target
         else:
-            target_battery = calculate_target_charge(
-                car_model, battery_level, dist_station_to_dest, ac_usage, min_threshold
-            )
-        if target_battery <= battery_level:
-            target_battery = battery_level + 1
+            # complete_trip mode: calculate how much charge is needed
+            # accounting for energy already spent reaching the station
+            dist_origin_to_station = _haversine(origin_lat, origin_lng, station_lat, station_lng)
+            effective_range        = specs["range_km"] * AC_MULTIPLIERS.get(ac_usage, 0.92)
+
+            # Battery remaining when arriving at the station
+            energy_to_station_pct  = (dist_origin_to_station / effective_range) * 100
+            battery_at_station     = max(min_threshold, battery_level - energy_to_station_pct)
+
+            # Energy needed from station to destination
+            energy_to_dest_pct     = (dist_station_to_dest / effective_range) * 100
+
+            # Target = enough to reach destination + min threshold buffer
+            target_battery         = battery_at_station + energy_to_dest_pct + min_threshold
+            target_battery         = min(round(target_battery), 80)  # cap at 80%
+            target_battery         = max(target_battery, round(battery_at_station) + 1)  # must charge at least 1%
+
+            print(f"[scoring] complete_trip: dist_to_station={round(dist_origin_to_station,1)}km, "
+                  f"battery_at_station={round(battery_at_station,1)}%, "
+                  f"energy_to_dest={round(energy_to_dest_pct,1)}%, "
+                  f"target={target_battery}%")
 
         charge_time        = estimate_charge_time(car_model, battery_level, target_battery, best_power_kw, best_is_dc)
         best_possible_time = estimate_charge_time(car_model, battery_level, target_battery, car_max_dc_kw, True)

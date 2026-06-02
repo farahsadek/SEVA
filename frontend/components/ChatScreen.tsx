@@ -87,6 +87,9 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
   const bottomRef                           = useRef<HTMLDivElement>(null);
   const [userLocation, setUserLocation]     = useState<{lat: number, lng: number} | null>(null);
   const [awaitingChargingMode, setAwaitingChargingMode] = useState(false);
+  const [awaitingBattery, setAwaitingBattery]           = useState(false);
+  const [manualBattery, setManualBattery]               = useState<string>("");
+  const [batteryChoice, setBatteryChoice]               = useState<"slider" | "manual">("slider");
   const [pendingMessage, setPendingMessage]             = useState<string | null>(null);
   const [lastMapData, setLastMapData]                   = useState<StationMapData[] | null>(null);
   const [recording, setRecording]                       = useState(false);
@@ -240,7 +243,25 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
     const currentBattery = msgBattery ?? batteryPct;
     if (msgBattery !== null) setBatteryPct(msgBattery);
 
-    if (looksLikeTrip(msg) && !awaitingChargingMode) {
+    const hasBatteryInMsg = extractBatteryFromMessage(msg) !== null ||
+      msg.toLowerCase().includes("battery") || msg.includes("%");
+    const tripWithoutBattery = (
+      (msg.toLowerCase().includes("going to") || msg.toLowerCase().includes("heading to") ||
+       msg.toLowerCase().includes("i want to go") || msg.toLowerCase().includes("driving to") ||
+       msg.toLowerCase().includes("travelling to") || msg.toLowerCase().includes("traveling to") ||
+       (msg.toLowerCase().includes("from") && msg.toLowerCase().includes("to")) ||
+       msg.toLowerCase().includes("i need to get to") || msg.toLowerCase().includes("destination"))
+      && !hasBatteryInMsg
+    );
+
+    if (tripWithoutBattery && !awaitingBattery && !awaitingChargingMode) {
+      setMessages(prev => [...prev, { role: "user", content: msg }]);
+      setPendingMessage(msg);
+      setAwaitingBattery(true);
+      return;
+    }
+
+    if (looksLikeTrip(msg) && !awaitingChargingMode && !awaitingBattery) {
       setMessages(prev => [...prev, { role: "user", content: msg }]);
       setPendingMessage(msg);
       setAwaitingChargingMode(true);
@@ -278,8 +299,11 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
     clearMemory(sessionId);
     setOpenMapKey(null);
     setAwaitingChargingMode(false);
+    setAwaitingBattery(false);
     setPendingMessage(null);
     setLastMapData(null);
+    setManualBattery("");
+    setBatteryChoice("slider");
   }
 
   async function handleChargingMode(mode: "complete_trip" | "charge_to_80" | "charge_to_100") {
@@ -327,6 +351,62 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
 
     setLoading(false);
     setPendingMessage(null);
+  }
+
+  async function handleBatteryAndMode(mode: "complete_trip" | "charge_to_80" | "charge_to_100") {
+    if (!pendingMessage) return;
+    setAwaitingBattery(false);
+
+    const chosenBattery = batteryChoice === "manual" && manualBattery
+      ? parseInt(manualBattery)
+      : batteryPct;
+
+    if (batteryChoice === "manual" && manualBattery) {
+      setBatteryPct(parseInt(manualBattery));
+    }
+
+    const modeLabels = {
+      complete_trip: "Just enough to complete the trip",
+      charge_to_80:  "Charge to 80%",
+      charge_to_100: "Charge to 100%",
+    };
+    setMessages(prev => [...prev, {
+      role: "user",
+      content: `Battery: ${chosenBattery}% — ${modeLabels[mode]}`,
+    }]);
+    setLoadingMessage("Finding the best chargers along your route ...");
+    setLoading(true);
+
+    try {
+      await fetch(`${API_BASE}/set_charging_mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+
+      const msgWithBattery = `${pendingMessage}, battery at ${chosenBattery}%`;
+      const res = await sendMessage(msgWithBattery, sessionId, {
+        ...profile, battery_pct: chosenBattery, current_location: userLocation,
+      });
+      const freshMapData = Array.isArray(res.map_data) && res.map_data.length > 0 ? res.map_data : null;
+      const mapData = freshMapData || lastMapData;
+      if (freshMapData) setLastMapData(freshMapData);
+      const cleanResponse = (res.response || "").replace("[SHOW_CARDS]", "").trim();
+      const parsed = parseResponse(cleanResponse, freshMapData ? mapData : null, !!freshMapData);
+      setMessages(prev => [...prev, {
+        role: "assistant", content: cleanResponse, parsed, mapData: freshMapData ? mapData : undefined,
+      }]);
+    } catch {
+      setMessages(prev => [...prev, {
+        role: "assistant",
+        content: "Sorry, I couldn't connect to the server. Please try again.",
+        parsed: parseResponse("", null),
+      }]);
+    }
+    setLoading(false);
+    setPendingMessage(null);
+    setManualBattery("");
+    setBatteryChoice("slider");
   }
 
   // ── Feedback submit ────────────────────────────────────────────────────────
@@ -640,6 +720,92 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
               </div>
             ))}
 
+            {/* Battery + mode selector */}
+            {awaitingBattery && (
+              <div style={{ maxWidth: "88%" }}>
+                <div style={{
+                  background: "var(--white)", border: "0.5px solid var(--border)",
+                  borderLeft: "3px solid var(--primary)",
+                  borderRadius: "0 12px 12px 12px", padding: "14px 16px",
+                }}>
+                  <p style={{ fontSize: 13, fontWeight: 500, color: "var(--text)", marginBottom: 10, marginTop: 0 }}>
+                    What is your current battery level?
+                  </p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+                    <label style={{
+                      display: "flex", alignItems: "center", gap: 10,
+                      padding: "10px 12px",
+                      border: batteryChoice === "slider" ? "1.5px solid var(--primary)" : "0.5px solid var(--border)",
+                      borderRadius: 8, cursor: "pointer",
+                      background: batteryChoice === "slider" ? "var(--bg)" : "transparent",
+                    }}>
+                      <input type="radio" name="battery-choice" checked={batteryChoice === "slider"}
+                        onChange={() => setBatteryChoice("slider")}
+                        style={{ accentColor: "var(--primary)", width: 15, height: 15, flexShrink: 0 }} />
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text)" }}>Use slider value</div>
+                        <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>Currently set to {batteryPct}%</div>
+                      </div>
+                    </label>
+                    <label style={{
+                      display: "flex", alignItems: "flex-start", gap: 10,
+                      padding: "10px 12px",
+                      border: batteryChoice === "manual" ? "1.5px solid var(--primary)" : "0.5px solid var(--border)",
+                      borderRadius: 8, cursor: "pointer",
+                      background: batteryChoice === "manual" ? "var(--bg)" : "transparent",
+                    }}>
+                      <input type="radio" name="battery-choice" checked={batteryChoice === "manual"}
+                        onChange={() => setBatteryChoice("manual")}
+                        style={{ accentColor: "var(--primary)", width: 15, height: 15, flexShrink: 0, marginTop: 2 }} />
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text)" }}>Enter manually</div>
+                        <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2, marginBottom: 8 }}>Type your actual battery percentage</div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <input type="number" min={1} max={100} placeholder="e.g. 60"
+                            value={manualBattery}
+                            disabled={batteryChoice !== "manual"}
+                            onChange={e => setManualBattery(e.target.value)}
+                            style={{
+                              width: 80, padding: "5px 8px", fontSize: 13,
+                              border: "0.5px solid var(--border)", borderRadius: 6,
+                              background: batteryChoice === "manual" ? "var(--white)" : "var(--bg)",
+                              color: "var(--text)", outline: "none",
+                            }} />
+                          <span style={{ fontSize: 12, color: "var(--muted)" }}>%</span>
+                        </div>
+                      </div>
+                    </label>
+                  </div>
+                  <p style={{ fontSize: 13, fontWeight: 500, color: "var(--text)", marginBottom: 10, marginTop: 0 }}>
+                    How would you like to charge?
+                  </p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {[
+                      { mode: "complete_trip" as const, icon: "ti-route",     label: "Just enough to complete the trip", sub: "Fastest stop, minimum charge" },
+                      { mode: "charge_to_80"  as const, icon: "ti-battery-2", label: "Charge to 80%",                   sub: "Recommended — fast & efficient" },
+                      { mode: "charge_to_100" as const, icon: "ti-battery-4", label: "Charge to 100%",                  sub: "Full charge, slower above 80%" },
+                    ].map(({ mode, icon, label, sub }) => (
+                      <button key={mode} onClick={() => handleBatteryAndMode(mode)} style={{
+                        background: "var(--bg)", border: "0.5px solid var(--border)",
+                        borderRadius: 8, padding: "10px 14px", cursor: "pointer",
+                        display: "flex", alignItems: "center", gap: 10, textAlign: "left",
+                        width: "100%", transition: "border-color 0.15s",
+                      }}
+                        onMouseEnter={e => (e.currentTarget.style.borderColor = "var(--primary)")}
+                        onMouseLeave={e => (e.currentTarget.style.borderColor = "var(--border)")}
+                      >
+                        <i className={"ti " + icon} style={{ fontSize: 18, color: "var(--accent)", flexShrink: 0 }} />
+                        <div>
+                          <div style={{ fontSize: 13, color: "var(--text)", fontWeight: 500 }}>{label}</div>
+                          <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{sub}</div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Charging mode picker */}
             {awaitingChargingMode && (
               <div style={{ maxWidth: "88%" }}>
@@ -715,13 +881,13 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
               onKeyDown={e => e.key === "Enter" && handleSend()}
               onFocus={e => (e.target.style.borderColor = "var(--primary)")}
               onBlur={e  => (e.target.style.borderColor = "var(--border)")}
-              disabled={awaitingChargingMode || recording || transcribing}
+              disabled={awaitingChargingMode || awaitingBattery || recording || transcribing}
             />
 
             {/* Mic button */}
             <button
               onClick={handleRecord}
-              disabled={loading || awaitingChargingMode || transcribing}
+              disabled={loading || awaitingChargingMode || awaitingBattery || transcribing}
               title={recording ? "Stop recording" : "Record voice message"}
               style={{
                 background: recording ? "#E24B4A" : "var(--bg)",
@@ -741,7 +907,7 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
             {/* Send button */}
             <button
               onClick={() => handleSend()}
-              disabled={loading || awaitingChargingMode}
+              disabled={loading || awaitingChargingMode || awaitingBattery}
               style={{
                 background: "var(--primary)", border: "none", borderRadius: 8,
                 padding: "10px 16px", color: "#F5F2EA", fontSize: 13, cursor: "pointer",

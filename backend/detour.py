@@ -125,17 +125,39 @@ def get_station_detours(
     dest_coords:       tuple,
     route_distance_km: float
 ) -> dict[int, float]:
+    """
+    Wrapper that handles async event loop issues on Windows/uvicorn.
+    Falls back to 0 detour for all stations if everything fails.
+    """
+    import concurrent.futures
+
+    # Method 1: ThreadPoolExecutor with timeout (handles running event loop)
     try:
         loop = asyncio.get_running_loop()
-        import concurrent.futures
+        print(f"[detour] Running loop detected — using ThreadPoolExecutor with 15s timeout")
         with concurrent.futures.ThreadPoolExecutor() as pool:
             future = pool.submit(
                 asyncio.run,
                 _fetch_all_detours(stations, origin_coords, dest_coords, route_distance_km)
             )
-            return future.result()
+            return future.result(timeout=15)
+    except concurrent.futures.TimeoutError:
+        print(f"[detour] ThreadPoolExecutor timed out after 15s — falling back to 0 detour")
+        return {s["id"]: 0 for s in stations}
     except RuntimeError:
-        # No running loop — safe to use asyncio.run directly
+        pass
+    except Exception as e:
+        print(f"[detour] ThreadPoolExecutor failed: {e}")
+
+    # Method 2: Direct asyncio.run (no running loop)
+    try:
+        print(f"[detour] No running loop — using asyncio.run directly")
         return asyncio.run(
             _fetch_all_detours(stations, origin_coords, dest_coords, route_distance_km)
         )
+    except Exception as e:
+        print(f"[detour] asyncio.run also failed: {e}")
+
+    # Method 3: Complete fallback — 0 detour for everything
+    print(f"[detour] All methods failed — returning 0 detour for all {len(stations)} stations")
+    return {s["id"]: 0 for s in stations}

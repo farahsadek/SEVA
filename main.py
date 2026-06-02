@@ -6,10 +6,16 @@ import uvicorn
 from groq import Groq
 
 
-from backend.llm import clear_last_map_data, get_seva_response, clear_memory, get_last_map_data, get_chat_history, set_charging_mode, clear_map_data_only
+from backend.llm import (
+    clear_last_map_data, clear_map_data_only,
+    run_recommendation_agent, handle_refine,
+    clear_memory, get_last_map_data, get_chat_history,
+    set_charging_mode, get_last_trip_context,
+)
 from backend.profile import load_profile, create_profile, save_profile, profile_exists, add_liked_station, add_avoided_station, add_preference_signal
 from data.ev_helper import get_all_brands, get_models_by_brand, get_car_specs
 from backend.geocoding import geocode
+from backend.router import answer_followup, classify_intent, answer_general
 
 app = FastAPI()
 
@@ -91,20 +97,64 @@ async def chat(req: ChatReq):
     pin  = req.profile.get("pin", "")
     fresh_profile = load_profile(name, pin)
     profile_to_use = fresh_profile if fresh_profile else req.profile
-
+ 
     profile_to_use["current_location"] = req.profile.get("current_location")
     profile_to_use["battery_pct"]      = req.profile.get("battery_pct", 100)
+ 
+    # ── Classify intent before doing anything ──
+    has_previous_stations = get_last_map_data() is not None
+    history               = get_chat_history(req.session_id)
+ 
+    classification = classify_intent(
+        user_message=req.message,
+        has_previous_stations=has_previous_stations,
+        recent_history=history[-6:] if history else []
+    )
+ 
+    intent       = classification["intent"]
+    modification = classification.get("modification")
+ 
+    print(f"[main] Intent: {intent} | Modification: {modification}")
+    
+    if intent == "error":
+        return {
+            "response": "I'm having trouble processing your message right now. Please try again in a moment.",
+            "map_data": None
+        }
+    # Clear stale map data only for new recommendations (not followup/refine)
+    if intent == "recommendation":
+        clear_map_data_only()
+ 
+    # ── Dispatch ──
+    if intent == "general":
+        response = answer_general(req.message)
+        return {"response": response, "map_data": None}
+    elif intent == "followup":
+        battery_kwh = 0
+        car_model = profile_to_use.get("car_model")
+        if car_model:
+            try:
+                from data.ev_helper import get_car_specs
+                specs = get_car_specs(car_model)
+                battery_kwh = specs.get("battery_kwh", 0)
+            except Exception:
+                pass
 
-    # Clear previous map data so follow-ups don't return stale stations
-    clear_map_data_only()
+        current_battery = profile_to_use.get("battery_pct", 100)
+        map_data = get_last_map_data()
 
-    response = get_seva_response(req.message, req.session_id, profile_to_use)
-    map_data = get_last_map_data()
-    return {
-        "response": response,
-        "map_data": map_data,
-    }
-
+        response = answer_followup(req.message, map_data, battery_kwh, current_battery)
+        return {"response": response, "map_data": None}
+    
+    elif intent == "refine":
+        response = handle_refine(req.message, modification, req.session_id, profile_to_use)
+        return {"response": response, "map_data": get_last_map_data()}
+ 
+    else:  # "recommendation"
+        response = run_recommendation_agent(req.message, req.session_id, profile_to_use)
+        map_data = get_last_map_data()
+        return {"response": response, "map_data": map_data}
+    
 @app.post("/login")
 async def login(req: LoginReq):
     profile = load_profile(req.name, req.pin)

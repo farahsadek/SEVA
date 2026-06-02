@@ -1,3 +1,9 @@
+"""
+llm.py — SEVA Recommendation Engine
+Sole responsibility: call find_charging_stations, score results, cache them.
+All personality, conversation, and followup handling lives in router.py.
+"""
+
 import os
 import re
 from langchain_groq import ChatGroq
@@ -10,43 +16,61 @@ from pymongo import MongoClient
 from .stations import get_stations_along_route
 from .scoring import score_and_rank_stations
 from .profile import get_default_profile, get_avoided_station_context
+from .routing import get_route
 
 load_dotenv()
 
+# ── LLM — tool-use model only, recommendation agent ──────────────────────────
 llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY"),
-    model="llama-3.1-8b-instant",
+    model="llama-3.3-70b-versatile",
     streaming=False,
     max_tokens=150
 )
 
-_current_profile  = None
-_last_map_data    = None
-_last_trip_origin = None      # remembers last known origin across turns
-_last_trip_dest   = None      # remembers last known destination across turns
+# ── Global cache ──────────────────────────────────────────────────────────────
+_current_profile    = None
+_last_map_data      = None
+_last_trip_origin   = None
+_last_trip_dest     = None
+_last_battery_level = None
+_last_station_pool  = None
 
 
+# ── Cache accessors ───────────────────────────────────────────────────────────
 def get_last_map_data():
     return _last_map_data
 
+def get_last_trip_context() -> dict | None:
+    if _last_trip_origin and _last_trip_dest:
+        return {
+            "origin":        _last_trip_origin,
+            "destination":   _last_trip_dest,
+            "battery_level": _last_battery_level,
+        }
+    return None
+
+def get_raw_station_pool() -> list | None:
+    return _last_station_pool
 
 def clear_last_map_data() -> None:
-    """Clear cached station and profile data when a new user logs in or logs out."""
-    global _last_map_data, _current_profile, _last_trip_origin, _last_trip_dest
-    _last_map_data    = None
-    _current_profile  = None
-    _last_trip_origin = None
-    _last_trip_dest   = None
-    print(f"[llm] Cleared cached profile and map data")
-
+    global _last_map_data, _current_profile, _last_trip_origin, _last_trip_dest, _last_battery_level, _last_station_pool
+    _last_map_data      = None
+    _current_profile    = None
+    _last_trip_origin   = None
+    _last_trip_dest     = None
+    _last_battery_level = None
+    _last_station_pool  = None
+    print("[llm] Cleared all cached data")
 
 def clear_map_data_only() -> None:
-    """Clear only map data between chat turns — preserves profile and trip context."""
     global _last_map_data
     _last_map_data = None
+    # Intentionally preserve _last_station_pool, _last_trip_origin/dest, _last_battery_level
+    # so refine and followup still work after a new recommendation clears the cards
 
 
-# ── Memory ────────────────────────────────────────────────────────────────────
+# ── MongoDB memory ────────────────────────────────────────────────────────────
 _mongo_client = MongoClient(os.getenv("MONGODB_URI"))
 
 checkpointer = MongoDBSaver(
@@ -63,75 +87,54 @@ def clear_memory(session_id: str) -> None:
     print(f"[llm] Memory cleared for session: {session_id}")
 
 
-# ── System Prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are SEVA, an intelligent Electric Vehicle charging assistant for Egyptian drivers.
-You help EV drivers find the best charging station that is route-aware, not just the nearest.
+# ── System Prompt — recommender only, no personality ─────────────────────────
+SYSTEM_PROMPT = """You are a tool-calling agent for SEVA, an EV charging assistant in Egypt.
+Your ONLY job is to call find_charging_stations with the correct origin, destination, and battery_level.
+You do NOT answer general questions. You do NOT answer follow-up questions. You only find charging stations.
+CRITICAL: Call find_charging_stations ONLY ONCE per user message. 
+Never call it twice. If you already have station results, write the intro sentence immediately.
 
-You are a conversational assistant. You remember everything said in the conversation.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHEN TO CALL find_charging_stations
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Call it when the user needs charging station recommendations for a specific trip.
+- NEVER call it for follow-up questions about stations already shown.
+- NEVER call brave_search, web_search, or any other tool — you only have find_charging_stations.
+- If battery context shows 30% or below AND a destination is mentioned → always call the tool immediately.
 
-CRITICAL OUTPUT RULES:
-- NEVER use HTML tags. No <div>, <span>, <p>, or any HTML.
-- NEVER use markdown code blocks (no ``` or ~~~).
-- Use ONLY plain text.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LOCATION HANDLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- If the message contains [Context: GPS_ORIGIN: lat,lng] → pass exactly "lat,lng" as origin.
+- If the user says "from Maadi" or "from GUC" → use that place name as origin exactly.
+- If neither GPS nor explicit origin is in the message → ask: "Where are you starting from?"
+- If a location name is unrecognized → ask the user to clarify. Never guess or invent locations.
+- Egypt-specific: common origins include Maadi, New Cairo, Nasr City, Heliopolis, Zamalek,
+  6th of October, Sheikh Zayed, Tagamoa, Rehab, Katameya, GUC, AUC, Cairo Festival City.
 
-RESPONSE RULES:
-- Answer the actual question being asked
-- For general EV questions, answer conversationally
-- No filler phrases like "Great question!"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BATTERY HANDLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Extract battery level as an integer (1–100) from the message or context.
+- Use [Context: Current battery level is X%] if the user didn't state it explicitly.
+- Never pass a string like "30%" — always pass the integer 30.
 
-WHEN TO CALL find_charging_stations:
-- ONLY call it for a brand new trip where the user needs station recommendations AND there is NO existing [Context: Top 3 recommended stations] in this message yet.
-- If [Context: Top 3 recommended stations] is already present, NEVER call the tool — answer entirely from that context.
-- Signs it's a follow-up (DO NOT call tool): "option 1/2/3", "the first/second/third one", "how much", "how long", "is it fast", "membership", "which is", "what about", "tell me more", "how far is the detour", price or time questions about a current recommendation.
-- Signs it's a new trip (call tool): user provides a new destination not discussed before.
-- If no stations are found along the route, say so clearly and suggest trying a nearby major area.
-- If battery context shows 30% or below, always call find_charging_stations — never tell the user they can complete a trip without verifying first.
-- You ONLY have access to find_charging_stations. NEVER attempt to call brave_search, web_search, or any other tool. If a location is unrecognized, ask the user to clarify — do not search the web.
-
-WHEN RECOMMENDING STATIONS:
-The tool returns top 3 stations as structured data. Write a single neutral intro sentence only.
-Do NOT list details — the UI displays the station cards automatically.
-Example intro: "Here are the top 3 charging stations for your route from [origin] to [destination]."
-Do NOT repeat operator, connectors, score, or any fields — they are shown in the cards.
-
-CHARGING PRICES IN EGYPT:
-- AC charging: 3.97 EGP per kWh
-- DC fast charging: 7.67 EGP per kWh
-To calculate cost: Energy (kWh) = (battery_kwh x percentage_to_charge / 100), then Cost = Energy x Rate.
-
-LOCATION HANDLING:
-- If the message contains [Context: GPS_ORIGIN: lat,lng], pass exactly "lat,lng" (just the number pair) as the origin parameter in find_charging_stations.
-- If the user explicitly states an origin like "from Maadi" or "from GUC", use that place name as origin — NOT the GPS coordinates.
-- If neither GPS nor explicit origin is available, ask: "Where are you starting from?"
-
-AVOIDED STATIONS:
-- If context contains AVOIDED STATIONS, never recommend any of those stations.
-
-WHEN ANSWERING FOLLOW-UP QUESTIONS:
-Use the station context [Context: Top 3 stations...] to answer precisely.
-If user asks about "option 2" or "the second one", answer about that specific station.
-If user asks a generic question like "which is fastest?", compare all 3.
-If user asks "how much will I pay?", use the Rate field and charge time to calculate exact EGP.
-Keep answers SHORT — maximum 2 sentences.
-Never repeat information the user didn't ask for.
-Never add unsolicited advice or extra context.
-
-Examples of good short answers:
-- "Is it a fast charger?" → "Yes, it has a 120kW DC charger."
-- "How much will I pay?" → "At 7.67 EGP/kWh for DC, charging from 60% to 80% (18 kWh) costs approximately 138 EGP."
-- "Do I need a membership?" → "Yes, this station requires a membership."
-- "How far is the detour?" → "The detour is 0.56 km from your route."
-
-Examples of bad long answers (never do this):
-- Restating the station name and all its details before answering
-- Adding "I hope this helps" or similar phrases
-- Explaining what DC charging is when the user just asked yes/no
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- NEVER use HTML tags in your response.
+- NEVER include GPS coordinates, lat/lng numbers, or any raw coordinate values.
+- Say "your current location" when the origin was GPS coordinates.
+- After the tool returns results, write ONE neutral intro sentence only.
+  Example: "Here are the top 3 charging stations for your route from Maadi to New Cairo."
+- Do NOT list station details — the UI renders cards automatically.
+- End your response with exactly: [SHOW_CARDS]
+- Do NOT add advice, comparisons, or extra commentary after [SHOW_CARDS].
 """
 
 
 # ── Location helpers ──────────────────────────────────────────────────────────
 def _looks_like_trip(msg: str) -> bool:
-    """Check if the message is a trip request with a destination."""
     lower = msg.lower()
     has_movement = any(p in lower for p in [
         "going to", "heading to", "driving to", "driving from",
@@ -144,9 +147,7 @@ def _looks_like_trip(msg: str) -> bool:
 
 
 def _has_explicit_origin(msg: str) -> bool:
-    """Check if user mentioned a specific named origin (not a generic phrase)."""
     lower = msg.lower()
-    # Look for standalone word "from" followed by a place name
     match = re.search(r'\bfrom\b\s+(\S+)', lower)
     if match:
         after_from = match.group(1).strip()
@@ -167,9 +168,7 @@ def get_chat_history(session_id: str) -> list:
 
     for msg in messages:
         if isinstance(msg, HumanMessage) and msg.content:
-            content = msg.content
-
-            # Strip ALL context blocks including multi-line avoided stations
+            content     = msg.content
             lines       = content.split("\n")
             clean_lines = []
             in_context  = False
@@ -178,7 +177,6 @@ def get_chat_history(session_id: str) -> list:
                 stripped = line.strip()
                 if stripped.startswith("[Context:"):
                     in_context = True
-                    # Single-line context block ends on same line
                     if stripped.endswith("]") and stripped.count("[") == stripped.count("]"):
                         in_context = False
                     continue
@@ -198,15 +196,15 @@ def get_chat_history(session_id: str) -> list:
     return history
 
 
-# ── RAG: format top 3 for LLM ────────────────────────────────────────────────
-def format_stations_for_llm(stations: list, charging_mode: str = "charge_to_80") -> str:
+# ── Format stations for LLM response ─────────────────────────────────────────
+def format_stations_for_llm(stations: list, charging_mode: str = "charge_to_80", destination: str = "") -> str:
     if not stations:
         return "No charging stations found along this route."
 
     count        = min(len(stations), 3)
     count_word   = {1: "one", 2: "two", 3: "three"}.get(count, str(count))
     target_label = "100%" if charging_mode == "charge_to_100" else "80%"
-    lines        = [f"TOP {count} CHARGING STATION{'S' if count > 1 else ''} (ranked best first, real data only):"]
+    lines        = [f"TOP {count} CHARGING STATION{'S' if count > 1 else ''} (ranked best first):"]
 
     for i, s in enumerate(stations[:3]):
         connector_details = ", ".join(
@@ -228,11 +226,12 @@ def format_stations_for_llm(stations: list, charging_mode: str = "charge_to_80")
             f"Score: {s.get('score', '?')}/100"
         )
 
+    dest_str = f" to {destination}" if destination else ""
     lines.append(
-        f"\nWrite ONE neutral intro sentence only. "
-        f"There are exactly {count_word} station{'s' if count > 1 else ''} — say 'top {count_word}' not 'top 3' unless there are 3. "
-        f"Do NOT list any station details — the UI renders cards automatically."
-        f"\nEnd your response with exactly: [SHOW_CARDS]"
+        f"\nWrite ONE neutral intro sentence: "
+        f"'Here are the top {count_word} charging station{'s' if count > 1 else ''} for your route{dest_str}.'"
+        f" Say 'your current location' if origin was GPS. "
+        f"Do NOT list details. End with exactly: [SHOW_CARDS]"
     )
     return "\n".join(lines)
 
@@ -249,82 +248,64 @@ def set_charging_mode(mode: str) -> None:
 @tool
 def find_charging_stations(origin: str, destination: str, battery_level: int = 100) -> str:
     """
-    Find real EV charging stations along a driving route in Egypt.
-    Only call this when the user is asking for charging station recommendations
-    for a specific trip with an origin and destination.
-    Do NOT call this for follow-up questions about stations already mentioned.
+    Find and rank EV charging stations along a driving route in Egypt.
+    Call this ONLY for trip-based station recommendations.
+    Do NOT call for follow-up questions about previously shown stations.
 
     Args:
-        origin: Starting location as a string or lat,lng coordinates (e.g. "Maadi" or "30.01,31.45")
-        destination: End location as a string (e.g. "Cairo Airport")
-        battery_level: Current battery as an integer between 1 and 100. Default is 100.
+        origin:        Starting location — place name (e.g. "Maadi") or "lat,lng" coordinates.
+        destination:   End location — place name (e.g. "Cairo Airport").
+        battery_level: Current battery percentage as integer (1–100). Default 100.
     """
-    global _current_profile, _last_map_data, _charging_mode, _last_trip_origin, _last_trip_dest
+    global _current_profile, _last_map_data, _charging_mode, _last_trip_origin, _last_trip_dest, _last_battery_level
 
-    # ── Store trip context for follow-up memory ──
+    # ── Cache trip context ──
     _last_trip_origin = origin
     _last_trip_dest   = destination
 
-    # ── Battery level ──
+    # ── Normalize battery level ──
     if battery_level is not None:
         try:
-            battery_level = int(battery_level)
+            battery_level       = int(battery_level)
+            _last_battery_level = battery_level
         except (ValueError, TypeError):
             battery_level = None
 
     if battery_level is None:
         battery_level = _current_profile.get("battery_pct", 100) if _current_profile else 100
 
-    print(f"[llm] Battery level used: {battery_level}%")
-    print(f"[llm] Origin received by tool: {origin}")
+    print(f"[llm] Battery: {battery_level}% | Origin: {origin} | Destination: {destination}")
 
     # ── Fetch route and stations ──
     stations, route = get_stations_along_route(origin, destination)
 
-    # ── Error Case 1: Location not recognized ──
+    # ── Error: location not recognized ──
     if not route and not stations:
-        # Try to give specific feedback about which location failed
         from .geocoding import geocode as _geocode
         origin_ok = _geocode(origin) is not None
         dest_ok   = _geocode(destination) is not None
         if not origin_ok and not dest_ok:
             return (
-                f"I couldn't recognize either '{origin}' or '{destination}' as a location in Egypt. "
-                f"Try using a well-known landmark, neighborhood, or compound name — "
-                f"for example 'Maadi', 'New Cairo', 'Cairo Festival City', or 'GUC'."
+                f"I couldn't recognize '{origin}' or '{destination}' as locations in Egypt. "
+                f"Try a well-known landmark or neighborhood like 'Maadi', 'New Cairo', or 'GUC'."
             )
         elif not origin_ok:
-            return (
-                f"I couldn't find '{origin}' on the map. "
-                f"Try a nearby landmark or neighborhood — for example 'Maadi' or 'Katameya'."
-            )
+            return f"I couldn't find '{origin}' on the map. Try a nearby landmark like 'Maadi' or 'Katameya'."
         elif not dest_ok:
-            return (
-                f"I couldn't find '{destination}' on the map. "
-                f"Try a nearby landmark or neighborhood instead."
-            )
+            return f"I couldn't find '{destination}' on the map. Try a nearby landmark or neighborhood."
         else:
-            return (
-                f"I couldn't calculate a driving route from '{origin}' to '{destination}'. "
-                f"Try using more specific location names."
-            )
+            return f"I couldn't calculate a route from '{origin}' to '{destination}'. Try more specific names."
 
-    # ── Error Case 2: Route found but no stations ──
     if not route:
+        return f"I found '{origin}' but couldn't calculate a route to '{destination}'. Please check the destination name."
+
+    if not stations:
         return (
-            f"I found '{origin}' on the map but couldn't calculate a route to '{destination}'. "
-            f"Please check the destination name and try again."
+            f"No charging stations found along the route from {origin} to {destination}. "
+            f"Egypt's network is growing — try routes through New Cairo, Maadi, or Sheikh Zayed."
         )
 
     print(f"[llm] Found {len(stations)} stations along route")
-
-    # ── Error Case 3: No stations along this route ──
-    if not stations:
-        return (
-            f"No charging stations were found along the route from {origin} to {destination}. "
-            f"Egypt's charging network is still growing — try a route through New Cairo, "
-            f"Maadi, or Sheikh Zayed where stations are more concentrated."
-        )
 
     # ── Score and rank ──
     if stations and route and _current_profile:
@@ -332,86 +313,64 @@ def find_charging_stations(origin: str, destination: str, battery_level: int = 1
             stations = score_and_rank_stations(
                 stations, _current_profile, route, battery_level, _charging_mode
             )
-            print(f"[llm] Stations scored and ranked successfully")
-            print(f"[llm] Top station score: {stations[0].get('score')}")
+            print(f"[llm] Scoring complete. Top score: {stations[0].get('score')}")
 
         except ValueError as e:
-            error_msg = str(e)
-            car_model = _current_profile.get("car_model", "your car")
+            error_msg     = str(e)
+            car_model     = _current_profile.get("car_model", "your car")
             min_threshold = _current_profile.get("min_battery_threshold", 20)
 
-            # ── Error Case 4: Already sufficient battery ──
             if "already at 80%" in error_msg or "already full" in error_msg:
-                return (
-                    f"Your battery is already at {battery_level}% — "
-                    f"no charging stop needed for this trip."
-                )
+                return f"Your battery is already at {battery_level}% — no charging needed for this trip."
 
-            # ── Error Case 5: Battery sufficient to complete trip ──
             elif "enough to complete" in error_msg or "No charging needed" in error_msg:
-                return (
-                    f"Good news — your {battery_level}% battery is enough to complete "
-                    f"this trip without stopping to charge. Have a safe drive!"
-                )
+                return f"Your {battery_level}% battery is enough to complete this trip without charging. Safe drive!"
 
-            # ── Error Case 6: Battery too low to reach any station ──
             elif "too low" in error_msg or "usable charge" in error_msg:
                 usable = max(0, battery_level - min_threshold)
                 return (
-                    f"Your battery is too low to safely reach any charging station. "
-                    f"At {battery_level}% with your {min_threshold}% minimum threshold, "
-                    f"you only have {usable}% of usable charge remaining. "
-                    f"Please charge to at least {min_threshold + 20}% before attempting this trip."
+                    f"Your battery is too low to reach any station safely. "
+                    f"At {battery_level}% with a {min_threshold}% minimum, you only have {usable}% usable. "
+                    f"Please charge to at least {min_threshold + 20}% first."
                 )
 
-            # ── Error Case 7: No compatible connectors ──
             elif "compatible" in error_msg or "connector" in error_msg:
                 return (
-                    f"None of the stations along this route have connectors compatible "
-                    f"with your {car_model}. "
-                    f"Try a different route or check your connector type in your profile settings."
+                    f"No stations along this route are compatible with your {car_model}. "
+                    f"Try a different route or check your connector type in profile settings."
                 )
 
-            # ── Error Case 8: All stations avoided ──
             elif "avoided" in error_msg:
                 return (
-                    f"All charging stations along this route are in your avoided list. "
-                    f"You can remove stations from your avoided list by tapping the feedback "
-                    f"button on a previous recommendation, or try a different route."
+                    f"All stations along this route are in your avoided list. "
+                    f"Remove some avoided stations or try a different route."
                 )
 
-            # ── Error Case 9: Car model not in database ──
             elif "not found in EV database" in error_msg:
-                return (
-                    f"I don't have specifications for '{car_model}' in my database. "
-                    f"Please update your car model in your profile settings."
-                )
+                return f"I don't have specs for '{car_model}'. Please update your car model in profile settings."
 
-            # ── Error Case 10: Detour too tight (no stations within limit) ──
             elif "detour" in error_msg.lower():
                 max_detour = _current_profile.get("max_detour_km", 5)
                 return (
-                    f"No charging stations were found within your {max_detour}km detour limit. "
-                    f"You can increase your maximum detour distance in your profile settings, "
-                    f"or try a different route."
+                    f"No stations within your {max_detour}km detour limit. "
+                    f"Increase your max detour in profile settings or try a different route."
                 )
 
-            # ── Error Case 11: Mixed rejections ──
             else:
                 return (
-                    f"No suitable charging stations were found for this trip. "
-                    f"This could be due to your connector type, battery level, or detour settings. "
+                    f"No suitable stations found — could be connector type, battery level, or detour settings. "
                     f"Try adjusting your profile preferences or choosing a different route."
                 )
 
         except Exception as e:
-            print(f"[llm] Scoring error, falling back to unranked: {e}")
+            print(f"[llm] Scoring error, using unranked results: {e}")
 
-    # ── Store top 3 in _last_map_data ──
+    # ── Cache top 3 and full pool ──
     if stations and route:
-        global _last_map_data
-        top3           = stations[:3]
-        _last_map_data = []
+        global _last_map_data, _last_station_pool
+        _last_station_pool = stations
+        top3               = stations[:3]
+        _last_map_data     = []
 
         for s in top3:
             connector_details = ", ".join(
@@ -432,7 +391,7 @@ def find_charging_stations(origin: str, destination: str, battery_level: int = 1
                 "origin_lng":         route["origin_coords"][1],
                 "dest_lat":           route["dest_coords"][0],
                 "dest_lng":           route["dest_coords"][1],
-                "origin_name":        origin,
+                "origin_name":        "Your current location" if origin and origin[0].isdigit() else origin,
                 "dest_name":          destination,
                 "operator":           s.get("operator", "Unknown"),
                 "connectors":         connector_details,
@@ -448,14 +407,11 @@ def find_charging_stations(origin: str, destination: str, battery_level: int = 1
                 "detour_km":          s.get("detour_km", 0),
             })
 
-    station_text = format_stations_for_llm(stations, _charging_mode)
-    print(f"[llm] Formatted station info for LLM:\n{station_text}")
+    station_text = format_stations_for_llm(stations, _charging_mode, destination)
+    print(f"[llm] Station text prepared for agent")
 
     if route:
-        return (
-            station_text +
-            f"\nROUTE: {route['distance_km']} km, ~{int(route['duration_min'])} min drive."
-        )
+        return station_text + f"\nROUTE: {route['distance_km']} km, ~{int(route['duration_min'])} min."
     return station_text
 
 
@@ -470,40 +426,35 @@ agent = create_react_agent(
 )
 
 
-# ── Main Chat Function ────────────────────────────────────────────────────────
-def get_seva_response(user_message: str, session_id: str = "default", profile: dict = None) -> str:
+# ── Recommendation agent entry point ─────────────────────────────────────────
+def run_recommendation_agent(user_message: str, session_id: str = "default", profile: dict = None) -> str:
     global _current_profile
     _current_profile = profile if profile else get_default_profile()
 
-    battery          = _current_profile.get("battery_pct", 100)
-    # Strip % sign if passed as string from frontend
+    battery = _current_profile.get("battery_pct", 100)
     if isinstance(battery, str):
         battery = int(battery.replace("%", "").strip())
+
     current_location = _current_profile.get("current_location")
 
-    battery_context = f"[Context: Current battery level is {battery}%]\n"
-
-    # ── Fix Issue 1: Inject reachability warning if battery is critically low ──
+    # ── Context injections ──
+    battery_context      = f"[Context: Current battery level is {battery}%]\n"
     reachability_context = ""
+    trip_context         = ""
+    location_context     = ""
+    station_context      = ""
+    avoided_context      = ""
+
     if battery <= 30:
-        reachability_context = (
-            f"[Context: Battery is {battery}%. Call find_charging_stations now.]\n"
-        )
-    # ── Fix Issue 2: Inject last known trip context for follow-up questions ──
-    trip_context = ""
+        reachability_context = f"[Context: Battery is critically low at {battery}%. Call find_charging_stations immediately.]\n"
+
     if _last_trip_origin and _last_trip_dest and not _looks_like_trip(user_message):
         trip_context = (
-            f"[Context: The user's current trip is from '{_last_trip_origin}' "
-            f"to '{_last_trip_dest}'. Use this if they ask follow-up questions "
-            f"about their trip without restating origin/destination.]\n"
+            f"[Context: Previous trip was from '{_last_trip_origin}' to '{_last_trip_dest}'. "
+            f"Use this if the user is asking about this trip without restating origin/destination.]\n"
         )
 
-    # location_context is set later in the injection block, only when GPS is actually used
-    location_context = ""
-
-    # ── RAG: inject all 3 station details for follow-up answers ──
-    station_context = ""
-    if _last_map_data and isinstance(_last_map_data, list) and len(_last_map_data) > 0:
+    if _last_map_data and isinstance(_last_map_data, list):
         parts = []
         for i, s in enumerate(_last_map_data):
             parts.append(
@@ -519,14 +470,12 @@ def get_seva_response(user_message: str, session_id: str = "default", profile: d
             )
         station_context = f"[Context: Top 3 recommended stations — {' || '.join(parts)}]\n"
 
-    # ── RAG: inject avoided stations ──
-    avoided_context = ""
     if _current_profile:
         avoided_str = get_avoided_station_context(_current_profile)
         if avoided_str:
             avoided_context = f"[Context: {avoided_str}]\n"
 
-    # ── Smart location injection ──
+    # ── GPS injection ──
     processed_message = user_message
     gps_injected      = False
 
@@ -535,78 +484,207 @@ def get_seva_response(user_message: str, session_id: str = "default", profile: d
         coords = f"{current_location['lat']},{current_location['lng']}"
 
         if "my current location" in lower or "from here" in lower:
-            # User explicitly referenced their location — replace the phrase with coords
             processed_message = user_message.replace("my current location", coords).replace("from here", coords)
             gps_injected      = True
-            print(f"[llm] Replaced location phrase with GPS coords")
+            print("[llm] Replaced location phrase with GPS coords")
 
         elif _looks_like_trip(user_message) and not _has_explicit_origin(user_message):
-            # Append GPS as a context block so it's stripped from chat history display
             processed_message = f"{user_message}\n[Context: GPS_ORIGIN: {coords}]"
             gps_injected      = True
-            print(f"[llm] No origin detected — appended GPS_ORIGIN tag")
+            print("[llm] Appended GPS_ORIGIN tag")
 
-    # Only inject location_context when GPS is actually being used as origin
     if current_location and gps_injected:
         location_context = (
-            f"[Context: GPS origin available: {current_location['lat']},{current_location['lng']}"
-            " — pass this as the origin to find_charging_stations.]\n"
+            f"[Context: GPS origin: {current_location['lat']},{current_location['lng']}"
+            " — pass as origin to find_charging_stations.]\n"
         )
-    else:
-        location_context = ""
 
-    augmented_message = battery_context + reachability_context + trip_context + location_context + station_context + avoided_context + processed_message
+    augmented_message = (
+        battery_context + reachability_context + trip_context +
+        location_context + station_context + avoided_context +
+        processed_message
+    )
 
     config = {"configurable": {"thread_id": session_id}}
-
-    print(f"[llm] Session ID: {session_id}")
-    print(f"[llm] Station context injected: {bool(station_context)}")
-    print(f"[llm] Avoided context injected: {bool(avoided_context)}")
+    print(f"[llm] Session: {session_id} | Station context: {bool(station_context)} | Avoided: {bool(avoided_context)}")
 
     # ── Trim history if too long ──
     try:
         checkpoint = checkpointer.get(config)
         if checkpoint:
-            existing_messages = checkpoint["channel_values"].get("messages", [])
-            if len(existing_messages) > 14:
-                print(f"[llm] Trimming history: {len(existing_messages)} → clearing")
+            msgs = checkpoint["channel_values"].get("messages", [])
+            if len(msgs) > 14:
+                print(f"[llm] History too long ({len(msgs)} msgs) — clearing")
                 db = _mongo_client["seva"]
                 db["checkpoints"].delete_many({"thread_id": session_id})
                 db["checkpoint_writes"].delete_many({"thread_id": session_id})
     except Exception as e:
         print(f"[llm] Trim check failed: {e}")
 
+    # ── Invoke agent ──
     try:
         result = agent.invoke(
             {"messages": [HumanMessage(content=augmented_message)]},
             config=config
         )
-
         for msg in reversed(result["messages"]):
             if isinstance(msg, AIMessage) and msg.content:
-                return msg.content
-
-        return "I couldn't generate a response. Please try again."
-
+                response = msg.content
+                # If agent wrote the intro but tool actually returned an error, surface the error
+                if "[SHOW_CARDS]" in response and not _last_map_data:
+                    # Tool ran but produced no stations — return last tool error instead
+                    for m in reversed(result["messages"]):
+                        if hasattr(m, "content") and isinstance(m.content, str):
+                            if any(err in m.content for err in [
+                                "battery is already", "enough to complete", "too low",
+                                "compatible", "avoided", "not found", "detour", "No suitable",
+                                "No charging stations", "couldn't recognize", "couldn't find",
+                                "couldn't calculate"
+                            ]):
+                                return m.content
+                return response
+    
     except Exception as e:
         error_str = str(e)
         print(f"[llm] Agent error: {e}")
 
         if "413" in error_str or "too large" in error_str.lower():
-            return "Our conversation has gotten quite long. Please start a new trip and I'll help you from here."
+            return "Our conversation is too long. Please start a new trip."
         elif "rate_limit" in error_str.lower() or "429" in error_str:
-            return "I'm a bit overloaded right now. Please wait a few seconds and try again."
+            return "I'm overloaded right now. Please wait a few seconds and try again."
         elif "timeout" in error_str.lower():
-            return "That took too long to process. Please try again — this sometimes happens with complex routes."
+            return "That took too long. Please try again — this sometimes happens with complex routes."
         elif "brave_search" in error_str or "tool_use_failed" in error_str or "tool call validation" in error_str:
-            return (
-                "I couldn't find that location. Try using a well-known Cairo landmark or neighborhood — "
-                "for example 'Maadi', 'New Cairo', 'Heliopolis', or 'Sheikh Zayed'."
-            )
+            return "I couldn't find that location. Try a well-known Cairo landmark like 'Maadi' or 'New Cairo'."
         elif "tool" in error_str.lower() and "not in request" in error_str.lower():
-            return (
-                "I couldn't recognize that location. Please use a specific place name in Egypt "
-                "and I'll find charging stations along your route."
-            )
+            return "I couldn't recognize that location. Please use a specific place name in Egypt."
         else:
             return "Something went wrong. Please try again or rephrase your request."
+
+
+# ── Refine — re-rank cached pool without new API call ────────────────────────
+def handle_refine(user_message: str, modification: str | None, session_id: str = "default", profile: dict = None) -> str:
+    global _current_profile, _last_map_data
+
+    if profile:
+        _current_profile = profile
+
+    # No cached pool → fall back to full recommendation
+    if not _last_station_pool or not _last_trip_origin or not _last_trip_dest:
+        print("[llm] handle_refine: no cached pool — falling back to agent")
+        return run_recommendation_agent(user_message, session_id, profile)
+
+    battery     = _last_battery_level or (_current_profile.get("battery_pct", 100) if _current_profile else 100)
+    destination = _last_trip_dest
+
+    # ── Battery override ──
+    if modification and "battery_level=" in modification:
+        try:
+            battery = int(modification.split("battery_level=")[1].split()[0])
+            print(f"[llm] handle_refine: battery → {battery}%")
+        except Exception:
+            pass
+
+    # ── Destination override → needs new route → full agent ──
+    if modification and "destination=" in modification:
+        new_dest    = modification.split("destination=")[1].strip()
+        destination = new_dest
+        print(f"[llm] handle_refine: destination → '{destination}'")
+        return run_recommendation_agent(
+            f"I want to go from {_last_trip_origin} to {destination}, battery at {battery}%",
+            session_id, profile
+        )
+
+    # ── Origin override → needs new route → full agent ──
+    if modification and "origin=" in modification.lower():
+        new_origin = modification.split("origin=")[1].strip()
+        print(f"[llm] handle_refine: origin → '{new_origin}'")
+        return run_recommendation_agent(
+            f"I want to go from {new_origin} to {destination}, battery at {battery}%",
+            session_id, profile
+        )
+
+    pool = _last_station_pool.copy()
+
+    # ── Exclusion filter ──
+    if modification and "exclude option" in modification.lower():
+        try:
+            idx = int(''.join(filter(str.isdigit, modification))) - 1
+            if _last_map_data and 0 <= idx < len(_last_map_data):
+                excluded_id = _last_map_data[idx]["station_id"]
+                pool = [s for s in pool if str(s["id"]) != str(excluded_id)]
+                print(f"[llm] handle_refine: excluded station {excluded_id}")
+        except Exception:
+            pass
+
+    # ── DC only filter ──
+    if modification and "dc_fast_only" in modification.lower():
+        dc_only = [s for s in pool if s.get("has_fast_charge")]
+        if dc_only:
+            pool = dc_only
+            print(f"[llm] handle_refine: DC-only filter → {len(pool)} stations")
+
+    # ── Re-sort by modification ──
+    if modification and "closer" in modification.lower():
+        pool = sorted(pool, key=lambda s: s.get("detour_km", 999))
+        print("[llm] handle_refine: sorted by detour (closer first)")
+
+    if modification and "cheaper" in modification.lower():
+        pool = sorted(pool, key=lambda s: 0 if not s.get("has_fast_charge") else 1)
+        print("[llm] handle_refine: sorted by price (cheaper first)")
+
+    if modification and "faster" in modification.lower():
+        pool = sorted(pool, key=lambda s: s.get("charge_time_min", 999))
+        print("[llm] handle_refine: sorted by charge time (fastest first)")
+
+    if not pool:
+        return "No stations match your refined criteria. Try adjusting your preferences or requesting a new route."
+
+    # ── Rebuild _last_map_data with new top 3 ──
+    route_obj = get_route(_last_trip_origin, destination)
+    if not route_obj:
+        return "I couldn't recalculate the route. Please try rephrasing your request."
+
+    top3           = pool[:3]
+    _last_map_data = []
+
+    for s in top3:
+        connector_details = ", ".join(
+            f"{c['connection_type_title']} ({c['power_kw']}kW)"
+            for c in s.get("connectors", [])
+            if c["connection_type_title"] != "Unknown"
+        ) or "Unknown"
+        is_dc = s["has_fast_charge"]
+        rate  = 7.67 if is_dc else 3.97
+        _last_map_data.append({
+            "station_id":         str(s["id"]),
+            "station_name":       s["name"],
+            "station_lat":        s["lat"],
+            "station_lng":        s["lng"],
+            "origin_lat":         route_obj["origin_coords"][0],
+            "origin_lng":         route_obj["origin_coords"][1],
+            "dest_lat":           route_obj["dest_coords"][0],
+            "dest_lng":           route_obj["dest_coords"][1],
+            "origin_name":        _last_trip_origin,
+            "dest_name":          destination,
+            "operator":           s.get("operator", "Unknown"),
+            "connectors":         connector_details,
+            "has_fast_charge":    s["has_fast_charge"],
+            "charge_time":        s.get("charge_time_min", "?"),
+            "target_battery":     s.get("target_battery", 80),
+            "score":              s.get("score", "?"),
+            "available":          s["available"],
+            "needs_membership":   s["needs_membership"],
+            "route_distance_km":  route_obj["distance_km"],
+            "route_duration_min": route_obj["duration_min"],
+            "rate_egp_kwh":       rate,
+            "detour_km":          s.get("detour_km", 0),
+        })
+
+    count      = len(top3)
+    count_word = {1: "one", 2: "two", 3: "three"}.get(count, str(count))
+    mod_desc   = f" ({modification})" if modification else ""
+    return (
+        f"Here are the top {count_word} refined charging station{'s' if count > 1 else ''} "
+        f"for your route from {_last_trip_origin} to {destination}{mod_desc}. [SHOW_CARDS]"
+    )

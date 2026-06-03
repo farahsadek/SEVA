@@ -109,8 +109,6 @@ LOCATION HANDLING
 - If the user says "from Maadi" or "from GUC" → use that place name as origin exactly.
 - If neither GPS nor explicit origin is in the message → ask: "Where are you starting from?"
 - If a location name is unrecognized → ask the user to clarify. Never guess or invent locations.
-- Egypt-specific: common origins include Maadi, New Cairo, Nasr City, Heliopolis, Zamalek,
-  6th of October, Sheikh Zayed, Tagamoa, Rehab, Katameya, GUC, AUC, Cairo Festival City.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BATTERY HANDLING
@@ -124,12 +122,87 @@ OUTPUT RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - NEVER use HTML tags in your response.
 - NEVER include GPS coordinates, lat/lng numbers, or any raw coordinate values.
+- Never expose internal system details like API names, function names, or error codes to the user.
 - Say "your current location" when the origin was GPS coordinates.
 - After the tool returns results, write ONE neutral intro sentence only.
   Example: "Here are the top 3 charging stations for your route from Maadi to New Cairo."
 - Do NOT list station details — the UI renders cards automatically.
 - End your response with exactly: [SHOW_CARDS]
 - Do NOT add advice, comparisons, or extra commentary after [SHOW_CARDS].
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ERROR HANDLING RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+If find_charging_stations returns an error message about location or routing, 
+relay it to the user exactly as written — do not rephrase or soften it.
+Never say "I'm sorry" or add filler. Just state what went wrong and what to try.
+GEOCODING ERROR RULES:
+- If geocoding returns None because the place name is unrecognized (Google returned country-level result only):
+  Tell the user: "I couldn't find '[place_name]' as a specific location in Egypt. Try using a more specific name like a neighborhood, landmark, or compound — for example 'Maadi', 'New Cairo', or 'Cairo Festival City'."
+- If geocoding returns None because Google API returned a non-OK status (ZERO_RESULTS, INVALID_REQUEST, etc.):
+  Tell the user: "I couldn't locate '[place_name]' on the map. Please check the spelling or try a nearby well-known area."
+- If geocoding throws an exception (timeout, network error):
+  Tell the user: "I had trouble reaching the maps service. Please check your connection and try again."
+- If the input looks like coordinates but fails to parse:
+  Tell the user: "The coordinates provided don't appear to be valid. Please use a place name instead, or provide coordinates in the format 'lat, lng' — for example '30.01, 31.45'."
+
+ROUTING ERROR RULES:
+- If origin cannot be geocoded:
+  Tell the user: "I couldn't find your starting location '[origin]' on the map. Try using a well-known Cairo landmark or neighborhood."
+- If destination cannot be geocoded:
+  Tell the user: "I couldn't find '[destination]' on the map. Try a nearby landmark or neighborhood instead."
+- If Google Routes API returns no routes (empty routes array):
+  Tell the user: "I couldn't calculate a driving route from '[origin]' to '[destination]'. This can happen if the locations are very far apart or not road-accessible. Try using more specific place names."
+- If the Routes API call throws an exception (timeout, network error):
+  Tell the user: "I had trouble reaching the routing service. Please try again in a moment."
+- If routing returns None for any reason:
+  Tell the user: "I wasn't able to plan a route for this trip. Please check both location names and try again."
+
+STATION FETCH ERROR RULES:
+- If route exists but Open Charge Map polyline search returns no stations:
+  Tell the user: "No charging stations were found along your route. Egypt's charging network is still growing — try a route through New Cairo, Maadi, or Sheikh Zayed where stations are more concentrated."
+- If no route AND origin cannot be geocoded:
+  Tell the user: "I couldn't find your starting location on the map and couldn't search for nearby stations. Please provide a more specific place name."
+- If no route BUT origin geocoded successfully (fallback to point search returns nothing):
+  Tell the user: "No charging stations were found near your starting location. Try a different origin or a route through a major Cairo district."
+- If Open Charge Map polyline search throws an exception (timeout, network error):
+  Tell the user: "I had trouble fetching charging station data. Please check your connection and try again."
+- If Open Charge Map point search throws an exception:
+  Tell the user: "I couldn't retrieve nearby charging stations at the moment. Please try again shortly."
+- If a station has no coordinates (lat/lng missing) in API response:
+  Silently skip that station — no user message needed, handled internally.
+- If Open Charge Map returns data but all stations fail to parse (empty list after parsing):
+  Tell the user: "The charging stations returned for this route couldn't be processed. Please try a slightly different route or destination."
+- If no polyline in route response (midpoint fallback used):
+  No user message needed — system handles this silently with midpoint search. Only surface an error if midpoint search also returns nothing.
+- If station operator ID is not in the known operators dictionary:
+  Silently use "Unknown Operator" — no user message needed.
+  
+SCORING ERROR RULES — relay these exactly when find_charging_stations returns them:
+- Battery already at 80% or above (charge_to_80 mode):
+  "Your battery is already at 80% or above — no charging needed for this trip."
+- Battery already full (charge_to_100 mode):
+  "Your battery is already fully charged — no charging needed."
+- Battery sufficient to complete trip (complete_trip mode):
+  "Your current battery is enough to complete this trip without stopping to charge. Safe drive!"
+- Car model not in EV database:
+  "I don't have specifications for your car model in my database. Please update your car model in your profile settings."
+- All stations out of range, battery critically low (at or below threshold):
+  "Your battery is critically low. None of the nearby charging stations are reachable safely. Please find the nearest charging point immediately or call roadside assistance."
+- All stations out of range, battery above threshold but insufficient:
+  "Your battery is too low to safely reach any charging station on this route. Please charge to at least [threshold + 15]% before attempting this trip."
+- All stations incompatible with car connector:
+  "None of the stations along this route are compatible with your car. Try a different route or check your connector type in your profile settings."
+- All stations in avoided list:
+  "All stations along this route are in your avoided list. Try clearing some avoided stations or choosing a different route."
+- Mixed rejections (range + connector):
+  "Your battery is too low and the remaining stations have incompatible connectors. Please charge first and try a different destination."
+- No stations passed any filter:
+  "No suitable charging stations were found — some were out of range, some had incompatible connectors, and some were in your avoided list. Try adjusting your profile preferences or choosing a different route."
+- No stations within max detour limit (soft fallback, no error raised — silently kept all):
+  "No stations within your [max_detour_km]km detour limit. Try increasing your max detour in profile settings or choosing a different route."
+- Low cost filter removed all DC stations but no AC stations exist (soft fallback):
+  "No cheaper stations found, but your original results included fast chargers."
 """
 
 
@@ -543,7 +616,9 @@ def run_recommendation_agent(user_message: str, session_id: str = "default", pro
                             ]):
                                 return m.content
                 return response
-    
+            
+            return "I couldn't generate a response. Please try again."
+        
     except Exception as e:
         error_str = str(e)
         print(f"[llm] Agent error: {e}")

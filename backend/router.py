@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_router_client = Groq(api_key=os.getenv("GROQ_ROUTER_API_KEY"))
+_router_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # ── SEVA Personality & Classification Prompt ──────────────────────────────────
 _ROUTER_SYSTEM = """You are SEVA, an intelligent Electric Vehicle charging assistant for Egyptian drivers.

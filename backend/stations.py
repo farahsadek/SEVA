@@ -12,7 +12,7 @@ load_dotenv()
 def get_stations_along_route(
     origin: str,
     destination: str,
-    search_radius_km: int = 5
+    search_radius_km: int = 10
 ) -> tuple[list, dict | None]:
     """
     Find charging stations along the driving route from origin to destination.
@@ -57,7 +57,7 @@ def get_stations_along_route(
                 "polyline":     polyline,
                 "distance":     search_radius_km,
                 "distanceunit": "KM",
-                "maxresults":   10,
+                "maxresults":   20,
                 "countrycode":  "EG",
                 "statustypeid": 50,
                 "compact":      False,
@@ -88,10 +88,10 @@ def get_stations_near_point(lat: float, lng: float) -> list:
             params={
                 "latitude":     lat,
                 "longitude":    lng,
-                "maxresults":   10,
+                "maxresults":   20,
                 "countrycode":  "EG",
                 "statustypeid": 50,
-                "distance":     10,
+                "distance":     20,
                 "distanceunit": "KM",
                 "compact":      False,
                 "verbose":      False,

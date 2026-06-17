@@ -104,6 +104,8 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
 
         filtered.append(station)
 
+    print(f"[scoring] Filter done: {len(filtered)} passed | {rejected_range} out-of-range | {rejected_connector} incompatible | {rejected_avoided} avoided")
+
     if not filtered:
         total = len(stations)
         if rejected_range == total:
@@ -172,11 +174,11 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
         )
         print(f"[scoring] Detours fetched: {detours}")
     except Exception as e:
-        print(f"[scoring] Detour calculation failed: {e} — using 0 detour for all stations")
-        detours = {s["id"]: 0 for s in filtered}
+        print(f"[scoring] Detour calculation failed: {e} — using haversine fallback for all stations")
+        detours = {s["id"]: None for s in filtered}
 
     # ── Hard filter: remove stations that exceed max_detour_km ───────────────
-    within_detour = [s for s in filtered if detours.get(s["id"], 0) <= max_detour_km]
+    within_detour = [s for s in filtered if (detours.get(s["id"]) or 0) <= max_detour_km]
     if within_detour:
         filtered = within_detour
         print(f"[scoring] Detour hard filter ({max_detour_km}km): {len(filtered)} stations remain")
@@ -192,7 +194,12 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
         station_lng = station["lng"]
 
         # Criterion 1: Detour (25 pts)
-        detour_km    = detours.get(station["id"], 0)
+        detour_km    = detours.get(station["id"])
+        if detour_km is None:
+            dist_to_station      = _haversine(origin_lat, origin_lng, station_lat, station_lng)
+            dist_station_to_dest = _haversine(station_lat, station_lng, dest_lat, dest_lng)
+            detour_km            = max(0, round(dist_to_station + dist_station_to_dest - route_distance_km, 2))
+            print(f"[scoring] Station {station['id']}: haversine fallback detour={detour_km}km")
         detour_score = 25 * (1 - min(detour_km, max_detour_km) / max_detour_km) if max_detour_km > 0 else 0
         score       += detour_score
         station["detour_km"] = round(detour_km, 2)  # ← stored for llm.py to read
@@ -227,7 +234,9 @@ def score_and_rank_stations(stations, profile, route, battery_level, charging_mo
             target_battery         = battery_at_station + energy_to_dest_pct + min_threshold
             target_battery         = min(round(target_battery), 80)
             target_battery         = max(target_battery, round(battery_at_station) + 1)
-            print(f"[scoring] complete_trip: battery_at_station={round(battery_at_station,1)}%, target={target_battery}%")
+            if target_battery - battery_level < 5:
+                print(f"[scoring] complete_trip: skipping station — charge delta too small ({target_battery - battery_level}%)")
+                continue
 
         charge_time        = estimate_charge_time(car_model, battery_level, target_battery, best_power_kw, best_is_dc)
         best_possible_time = estimate_charge_time(car_model, battery_level, target_battery, car_max_dc_kw, True)

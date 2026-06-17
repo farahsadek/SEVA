@@ -21,10 +21,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://seva-production-0dbc.up.railway.app"
-    ],
+    allow_origins=["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -134,7 +131,6 @@ async def chat(req: ChatReq):
         car_model = profile_to_use.get("car_model")
         if car_model:
             try:
-                from data.ev_helper import get_car_specs
                 specs = get_car_specs(car_model)
                 battery_kwh = specs.get("battery_kwh", 0)
             except Exception:

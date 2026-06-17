@@ -114,8 +114,8 @@ async def _fetch_all_detours(
             print(f"[detour] Station {station_id}: total={total_km}km, detour={detour_km:.2f}km")
         else:
             # Fallback to 0 if API call failed
-            detours[station_id] = 0
-            print(f"[detour] Station {station_id}: fallback to 0 detour")
+            detours[station_id] = None
+            print(f"[detour] Station {station_id}: API failed — will use haversine fallback in scoring")
 
     return detours
 

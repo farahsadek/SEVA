@@ -35,6 +35,7 @@ _last_trip_origin   = None
 _last_trip_dest     = None
 _last_battery_level = None
 _last_station_pool  = None
+_last_route         = None
 
 
 # ── Cache accessors ───────────────────────────────────────────────────────────
@@ -54,13 +55,14 @@ def get_raw_station_pool() -> list | None:
     return _last_station_pool
 
 def clear_last_map_data() -> None:
-    global _last_map_data, _current_profile, _last_trip_origin, _last_trip_dest, _last_battery_level, _last_station_pool
+    global _last_map_data, _current_profile, _last_trip_origin, _last_trip_dest, _last_battery_level, _last_station_pool, _last_route
     _last_map_data      = None
     _current_profile    = None
     _last_trip_origin   = None
     _last_trip_dest     = None
     _last_battery_level = None
     _last_station_pool  = None
+    _last_route         = None
     print("[llm] Cleared all cached data")
 
 def clear_map_data_only() -> None:
@@ -214,9 +216,15 @@ def _looks_like_trip(msg: str) -> bool:
         "travelling to", "traveling to", "i want to go",
         "i am going", "i'm going", "i need to get to",
         "destination", "route",
+        "recommend", "recommendations", "give me recommendations",
+        "suggest", "find me", "show me",
+        "i am at", "i'm at", "starting from", "from my",
+        "need to reach", "need to charge", "want to charge",
+        "want to reach", "can i make it to", "can i reach",
     ])
     has_battery = any(p in lower for p in ["battery", "%", "charge"])
-    return has_movement and has_battery
+    has_location_phrase = any(p in lower for p in ["my current location", "from here"])
+    return has_movement and (has_battery or has_location_phrase)
 
 
 def _has_explicit_origin(msg: str) -> bool:
@@ -443,6 +451,7 @@ def find_charging_stations(origin: str, destination: str, battery_level: int = 1
         global _last_map_data, _last_station_pool
         _last_station_pool = stations
         top3               = stations[:3]
+        _last_route        = route
         _last_map_data     = []
 
         for s in top3:
@@ -698,7 +707,14 @@ def handle_refine(user_message: str, modification: str | None, session_id: str =
         if dc_only:
             pool = dc_only
             print(f"[llm] handle_refine: DC-only filter → {len(pool)} stations")
-
+    # ── No membership filter ──
+    if modification and "no_membership" in modification.lower():
+        public_only = [s for s in pool if not s.get("needs_membership")]
+        if public_only:
+            pool = public_only
+            print(f"[llm] handle_refine: no_membership filter → {len(pool)} stations")
+        else:
+            print(f"[llm] handle_refine: no public stations found — keeping all as fallback")
     # ── Re-sort by modification ──
     if modification and "closer" in modification.lower():
         pool = sorted(pool, key=lambda s: s.get("detour_km", 999))
@@ -716,10 +732,10 @@ def handle_refine(user_message: str, modification: str | None, session_id: str =
         return "No stations match your refined criteria. Try adjusting your preferences or requesting a new route."
 
     # ── Rebuild _last_map_data with new top 3 ──
-    route_obj = get_route(_last_trip_origin, destination)
+    route_obj = _last_route
     if not route_obj:
         return "I couldn't recalculate the route. Please try rephrasing your request."
-
+    print(f"[llm] handle_refine: pool size = {len(pool)}")
     top3           = pool[:3]
     _last_map_data = []
 

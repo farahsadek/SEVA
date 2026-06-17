@@ -608,7 +608,7 @@ export default function ChatScreen({ profile, onLogout, onUpdateProfile }: Props
                 padding: "40px 60px", textAlign: "center",
               }}>
                 <div style={{ fontSize: 32, fontWeight: 600, color: "var(--primary)", marginBottom: 16, lineHeight: 1.3 }}>
-                  Where are you heading today, {profile.name}?
+                  How can I help you today, {profile.name}?
                 </div>
                 <div style={{ fontSize: 15, color: "var(--muted)", lineHeight: 1.7, maxWidth: 420 }}>
                   Type your route and current battery level and I'll find the best

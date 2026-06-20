@@ -50,8 +50,10 @@ def get_stations_along_route(
         return get_stations_near_point(mid_lat, mid_lng), route
 
     # ── Polyline search (primary path) ──────────────────────
+    print(f"[stations] Polyline length: {len(polyline)} chars")
+
     try:
-        data = requests.get(
+        response = requests.get(
             "https://api.openchargemap.io/v3/poi",
             params={
                 "polyline":     polyline,
@@ -65,8 +67,17 @@ def get_stations_along_route(
                 "key":          os.getenv("OPENCHARGE_MAP_API_KEY")
             },
             timeout=10
-        ).json()
+        )
 
+        print(f"[stations] OCM polyline search status: {response.status_code}")
+
+        if response.status_code != 200:
+            print(f"[stations] OCM error body (first 300 chars): {response.text[:300]}")
+            print("[stations] Falling back to origin point search")
+            orig_lat, orig_lng = route["origin_coords"]
+            return get_stations_near_point(orig_lat, orig_lng), route
+
+        data = response.json()
         stations = parse_stations(data)
 
         if not stations:
@@ -78,12 +89,14 @@ def get_stations_along_route(
 
     except Exception as e:
         print(f"[stations] Polyline search error: {e}")
-        return [], route
+        print("[stations] Falling back to origin point search")
+        orig_lat, orig_lng = route["origin_coords"]
+        return get_stations_near_point(orig_lat, orig_lng), route
 
 
 def get_stations_near_point(lat: float, lng: float) -> list:
     try:
-        data = requests.get(
+        response = requests.get(
             "https://api.openchargemap.io/v3/poi",
             params={
                 "latitude":     lat,
@@ -98,8 +111,15 @@ def get_stations_near_point(lat: float, lng: float) -> list:
                 "key":          os.getenv("OPENCHARGE_MAP_API_KEY")
             },
             timeout=5
-        ).json()
+        )
 
+        print(f"[stations] OCM point search status: {response.status_code}")
+
+        if response.status_code != 200:
+            print(f"[stations] OCM error body (first 300 chars): {response.text[:300]}")
+            return []
+
+        data = response.json()
         return parse_stations(data)
 
     except Exception as e:
